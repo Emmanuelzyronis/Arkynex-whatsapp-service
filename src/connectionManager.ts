@@ -3,6 +3,7 @@ import makeWASocket, {
   WASocket,
   fetchLatestBaileysVersion,
   Browsers,
+  proto,
 } from '@whiskeysockets/baileys'
 import { Boom } from '@hapi/boom'
 import QRCode from 'qrcode'
@@ -131,11 +132,13 @@ export async function connectAgent(agentId: string): Promise<void> {
       if (!msgId) continue
 
       const status = update.update.status
+      // proto.WebMessageInfo.Status: ERROR=0 PENDING=1 SERVER_ACK=2 DELIVERY_ACK=3 READ=4 PLAYED=5
       let waStatus: string | null = null
-      if (status === 2) waStatus = 'sent'
-      else if (status === 3) waStatus = 'delivered'
-      else if (status === 4) waStatus = 'read'
-      else if (status === -1) waStatus = 'failed'
+      if (status === proto.WebMessageInfo.Status.SERVER_ACK) waStatus = 'sent'
+      else if (status === proto.WebMessageInfo.Status.DELIVERY_ACK) waStatus = 'delivered'
+      else if (status === proto.WebMessageInfo.Status.READ) waStatus = 'read'
+      else if (status === proto.WebMessageInfo.Status.PLAYED) waStatus = 'read'
+      else if (status === proto.WebMessageInfo.Status.ERROR) waStatus = 'failed'
 
       if (waStatus) {
         await supabase
