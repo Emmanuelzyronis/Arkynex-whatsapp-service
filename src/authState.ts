@@ -34,23 +34,29 @@ export async function useSupabaseAuthState(agentId: string): Promise<{
   saveCreds: () => Promise<void>
 }> {
   // Load existing session from Supabase
-  const { data: session } = await supabase
+  const { data: session, error: loadError } = await supabase
     .from('wa_sessions')
     .select('creds, keys')
     .eq('agent_id', agentId)
     .maybeSingle()
 
+  if (loadError) {
+    console.error(
+      `[authState] Failed to load session for ${agentId} — check SUPABASE_SERVICE_ROLE_KEY:`,
+      loadError
+    )
+  }
+
   let creds: AuthenticationCreds = session?.creds
     ? deserialize<AuthenticationCreds>(session.creds)
     : initAuthCreds()
 
-  // keys holds all Signal protocol key material, keyed by type then id
   let keys: Record<string, Record<string, unknown>> = session?.keys
     ? deserialize<Record<string, Record<string, unknown>>>(session.keys)
     : {}
 
   const persistState = async () => {
-    await supabase
+    const { error } = await supabase
       .from('wa_sessions')
       .upsert(
         {
@@ -61,6 +67,13 @@ export async function useSupabaseAuthState(agentId: string): Promise<{
         },
         { onConflict: 'agent_id' }
       )
+    if (error) {
+      // Surface this in Railway logs — if it appears, SUPABASE_SERVICE_ROLE_KEY is likely wrong
+      console.error(
+        `[authState] persistState FAILED for ${agentId} — check SUPABASE_SERVICE_ROLE_KEY:`,
+        error
+      )
+    }
   }
 
   return {
@@ -75,7 +88,6 @@ export async function useSupabaseAuthState(agentId: string): Promise<{
           for (const id of ids) {
             let value = keys[type]?.[id]
             if (value !== undefined) {
-              // app-state-sync-key needs to be reconstructed from proto
               if (type === 'app-state-sync-key') {
                 value = proto.Message.AppStateSyncKeyData.fromObject(
                   value as Record<string, unknown>
@@ -86,7 +98,11 @@ export async function useSupabaseAuthState(agentId: string): Promise<{
           }
           return result
         },
-        async set(data: { [T in keyof SignalDataTypeMap]?: { [id: string]: SignalDataTypeMap[T] | null | undefined } }) {
+        async set(data: {
+          [T in keyof SignalDataTypeMap]?: {
+            [id: string]: SignalDataTypeMap[T] | null | undefined
+          }
+        }) {
           for (const category of Object.keys(data) as Array<keyof SignalDataTypeMap>) {
             const categoryData = data[category]
             if (!categoryData) continue

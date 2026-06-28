@@ -22,16 +22,33 @@ const sockets = new Map<string, WASocket>()
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function setProfileStatus(agentId: string, status: string) {
-  await supabase.from('profiles').update({ wa_status: status }).eq('id', agentId)
+  const { error } = await supabase
+    .from('profiles')
+    .update({ wa_status: status })
+    .eq('id', agentId)
+  if (error) {
+    logger.error({ error, agentId, status }, 'setProfileStatus: Supabase write failed')
+  }
 }
 
-async function setSessionStatus(agentId: string, status: string, extra: Record<string, unknown> = {}) {
-  await supabase
+async function setSessionStatus(
+  agentId: string,
+  status: string,
+  extra: Record<string, unknown> = {}
+) {
+  const { error } = await supabase
     .from('wa_sessions')
     .upsert(
       { agent_id: agentId, status, updated_at: new Date().toISOString(), ...extra },
       { onConflict: 'agent_id' }
     )
+  if (error) {
+    // This is the #1 silent failure point — log clearly so it shows in Railway logs
+    logger.error(
+      { error, agentId, status, extra: Object.keys(extra) },
+      'setSessionStatus: Supabase upsert FAILED — check SUPABASE_SERVICE_ROLE_KEY in Railway env'
+    )
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -44,7 +61,19 @@ export async function connectAgent(agentId: string): Promise<void> {
     return
   }
 
-  const { version } = await fetchLatestBaileysVersion()
+  // fetchLatestBaileysVersion makes an HTTP call to WhatsApp's servers.
+  // If it fails (network issue on Railway, WhatsApp endpoint change, etc.)
+  // we fall back to a known-good version rather than aborting the whole flow.
+  let version: [number, number, number]
+  try {
+    const result = await fetchLatestBaileysVersion()
+    version = result.version
+    logger.info({ version }, 'Baileys version fetched')
+  } catch (err) {
+    version = [2, 3000, 1023460110] // last known-good fallback
+    logger.warn({ err, version }, 'fetchLatestBaileysVersion failed — using fallback version')
+  }
+
   const { state, saveCreds } = await useSupabaseAuthState(agentId)
 
   await setProfileStatus(agentId, 'connecting')
@@ -75,9 +104,9 @@ export async function connectAgent(agentId: string): Promise<void> {
         const qrDataUrl = await QRCode.toDataURL(qr, { margin: 2, scale: 6 })
         await setSessionStatus(agentId, 'qr_ready', { qr_code: qrDataUrl })
         await setProfileStatus(agentId, 'qr_ready')
-        logger.info({ agentId }, 'QR code generated')
+        logger.info({ agentId }, 'QR code generated and saved to Supabase')
       } catch (err) {
-        logger.error({ err, agentId }, 'QR generation failed')
+        logger.error({ err, agentId }, 'QR generation or Supabase write failed')
       }
     }
 
@@ -86,7 +115,7 @@ export async function connectAgent(agentId: string): Promise<void> {
       await setSessionStatus(agentId, 'connected', {
         phone_jid: phoneJid,
         connected_at: new Date().toISOString(),
-        qr_code: null, // clear QR once connected
+        qr_code: null,
       })
       await setProfileStatus(agentId, 'connected')
       logger.info({ agentId, phoneJid }, 'WhatsApp connected')
@@ -99,15 +128,14 @@ export async function connectAgent(agentId: string): Promise<void> {
       const loggedOut = statusCode === DisconnectReason.loggedOut
 
       if (loggedOut) {
-        // Wipe session on logout so agent must scan QR again
-        await supabase
+        const { error } = await supabase
           .from('wa_sessions')
           .update({ creds: null, keys: null, status: 'disconnected', phone_jid: null, qr_code: null })
           .eq('agent_id', agentId)
+        if (error) logger.error({ error, agentId }, 'Failed to clear session on logout')
         await setProfileStatus(agentId, 'disconnected')
         logger.info({ agentId }, 'Logged out — session cleared')
       } else {
-        // Transient disconnect — reconnect automatically
         logger.warn({ agentId, statusCode }, 'Disconnected — reconnecting...')
         await setProfileStatus(agentId, 'connecting')
         setTimeout(() => connectAgent(agentId), 3000)
@@ -132,7 +160,6 @@ export async function connectAgent(agentId: string): Promise<void> {
       if (!msgId) continue
 
       const status = update.update.status
-      // proto.WebMessageInfo.Status: ERROR=0 PENDING=1 SERVER_ACK=2 DELIVERY_ACK=3 READ=4 PLAYED=5
       let waStatus: string | null = null
       if (status === proto.WebMessageInfo.Status.SERVER_ACK) waStatus = 'sent'
       else if (status === proto.WebMessageInfo.Status.DELIVERY_ACK) waStatus = 'delivered'
@@ -141,11 +168,12 @@ export async function connectAgent(agentId: string): Promise<void> {
       else if (status === proto.WebMessageInfo.Status.ERROR) waStatus = 'failed'
 
       if (waStatus) {
-        await supabase
+        const { error } = await supabase
           .from('communications')
           .update({ wa_status: waStatus })
           .eq('whatsapp_message_id', msgId)
           .eq('agent_id', agentId)
+        if (error) logger.error({ error, msgId, waStatus }, 'Failed to update message status')
       }
     }
   })
@@ -165,10 +193,11 @@ export async function disconnectAgent(agentId: string): Promise<void> {
     }
     sockets.delete(agentId)
   }
-  await supabase
+  const { error } = await supabase
     .from('wa_sessions')
     .update({ creds: null, keys: null, status: 'disconnected', phone_jid: null, qr_code: null })
     .eq('agent_id', agentId)
+  if (error) logger.error({ error, agentId }, 'Failed to clear session on disconnect')
   await setProfileStatus(agentId, 'disconnected')
   logger.info({ agentId }, 'Disconnected by agent')
 }
@@ -185,7 +214,6 @@ export async function sendMessage(
   const sock = sockets.get(agentId)
   if (!sock) throw new Error('Agent not connected to WhatsApp')
 
-  // Build JID — strip non-digits, ensure Nigerian country code prefix if needed
   const digits = phone.replace(/\D/g, '')
   const jid = digits + '@s.whatsapp.net'
 
@@ -209,10 +237,15 @@ export function isConnected(agentId: string): boolean {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function restoreActiveSessions(): Promise<void> {
-  const { data: sessions } = await supabase
+  const { data: sessions, error } = await supabase
     .from('wa_sessions')
     .select('agent_id, creds')
     .eq('status', 'connected')
+
+  if (error) {
+    logger.error({ error }, 'restoreActiveSessions: Supabase query failed — check env vars')
+    return
+  }
 
   if (!sessions?.length) {
     logger.info('No active sessions to restore')
@@ -222,7 +255,6 @@ export async function restoreActiveSessions(): Promise<void> {
   logger.info({ count: sessions.length }, 'Restoring active sessions')
   for (const session of sessions) {
     if (session.creds) {
-      // connectAgent will attempt to reconnect without QR using stored creds
       connectAgent(session.agent_id).catch((err) =>
         logger.error({ err, agentId: session.agent_id }, 'Failed to restore session')
       )
