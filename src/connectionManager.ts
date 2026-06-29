@@ -14,7 +14,6 @@ import { supabase } from './supabase'
 
 const logger = pino({ name: 'connection-manager' })
 
-// In-memory socket registry — one socket per agentId
 const sockets = new Map<string, WASocket>()
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -26,9 +25,7 @@ async function setProfileStatus(agentId: string, status: string) {
     .from('profiles')
     .update({ wa_status: status })
     .eq('id', agentId)
-  if (error) {
-    logger.error({ error, agentId, status }, 'setProfileStatus: Supabase write failed')
-  }
+  if (error) logger.error({ error, agentId, status }, 'setProfileStatus: Supabase write failed')
 }
 
 async function setSessionStatus(
@@ -43,7 +40,6 @@ async function setSessionStatus(
       { onConflict: 'agent_id' }
     )
   if (error) {
-    // This is the #1 silent failure point — log clearly so it shows in Railway logs
     logger.error(
       { error, agentId, status, extra: Object.keys(extra) },
       'setSessionStatus: Supabase upsert FAILED — check SUPABASE_SERVICE_ROLE_KEY in Railway env'
@@ -51,8 +47,17 @@ async function setSessionStatus(
   }
 }
 
+// Normalise Nigerian phone numbers to international digits (no + or spaces)
+// e.g. "08012345678" → "2348012345678", "+234 801 234 5678" → "2348012345678"
+function normalisePhone(phone: string): string {
+  const digits = phone.replace(/\D/g, '')
+  if (digits.startsWith('0')) return `234${digits.slice(1)}`
+  if (digits.startsWith('234')) return digits
+  return digits
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
-// Connect
+// Connect (QR flow)
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function connectAgent(agentId: string): Promise<void> {
@@ -61,23 +66,20 @@ export async function connectAgent(agentId: string): Promise<void> {
     return
   }
 
-  // fetchLatestBaileysVersion makes an HTTP call to WhatsApp's servers.
-  // If it fails (network issue on Railway, WhatsApp endpoint change, etc.)
-  // we fall back to a known-good version rather than aborting the whole flow.
   let version: [number, number, number]
   try {
     const result = await fetchLatestBaileysVersion()
     version = result.version
     logger.info({ version }, 'Baileys version fetched')
   } catch (err) {
-    version = [2, 3000, 1023460110] // last known-good fallback
+    version = [2, 3000, 1023460110]
     logger.warn({ err, version }, 'fetchLatestBaileysVersion failed — using fallback version')
   }
 
   const { state, saveCreds } = await useSupabaseAuthState(agentId)
 
   await setProfileStatus(agentId, 'connecting')
-  await setSessionStatus(agentId, 'connecting', { qr_code: null })
+  await setSessionStatus(agentId, 'connecting', { qr_code: null, pairing_code: null })
 
   const sock = makeWASocket({
     version,
@@ -90,19 +92,15 @@ export async function connectAgent(agentId: string): Promise<void> {
   })
 
   sockets.set(agentId, sock)
-
-  // Persist credentials whenever they change
   sock.ev.on('creds.update', saveCreds)
 
-  // ── Connection lifecycle ──
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update
 
-    // QR code ready — convert to data URL and push via Supabase so frontend picks it up
     if (qr) {
       try {
         const qrDataUrl = await QRCode.toDataURL(qr, { margin: 2, scale: 6 })
-        await setSessionStatus(agentId, 'qr_ready', { qr_code: qrDataUrl })
+        await setSessionStatus(agentId, 'qr_ready', { qr_code: qrDataUrl, pairing_code: null })
         await setProfileStatus(agentId, 'qr_ready')
         logger.info({ agentId }, 'QR code generated and saved to Supabase')
       } catch (err) {
@@ -116,6 +114,7 @@ export async function connectAgent(agentId: string): Promise<void> {
         phone_jid: phoneJid,
         connected_at: new Date().toISOString(),
         qr_code: null,
+        pairing_code: null,
       })
       await setProfileStatus(agentId, 'connected')
       logger.info({ agentId, phoneJid }, 'WhatsApp connected')
@@ -123,14 +122,13 @@ export async function connectAgent(agentId: string): Promise<void> {
 
     if (connection === 'close') {
       sockets.delete(agentId)
-
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode
       const loggedOut = statusCode === DisconnectReason.loggedOut
 
       if (loggedOut) {
         const { error } = await supabase
           .from('wa_sessions')
-          .update({ creds: null, keys: null, status: 'disconnected', phone_jid: null, qr_code: null })
+          .update({ creds: null, keys: null, status: 'disconnected', phone_jid: null, qr_code: null, pairing_code: null })
           .eq('agent_id', agentId)
         if (error) logger.error({ error, agentId }, 'Failed to clear session on logout')
         await setProfileStatus(agentId, 'disconnected')
@@ -143,22 +141,17 @@ export async function connectAgent(agentId: string): Promise<void> {
     }
   })
 
-  // ── Incoming messages ──
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return
     for (const msg of messages) {
-      if (!msg.key.fromMe) {
-        await handleIncomingMessage(agentId, msg)
-      }
+      if (!msg.key.fromMe) await handleIncomingMessage(agentId, msg)
     }
   })
 
-  // ── Outgoing message status updates (sent → delivered → read) ──
   sock.ev.on('messages.update', async (updates) => {
     for (const update of updates) {
       const msgId = update.key.id
       if (!msgId) continue
-
       const status = update.update.status
       let waStatus: string | null = null
       if (status === proto.WebMessageInfo.Status.SERVER_ACK) waStatus = 'sent'
@@ -166,7 +159,6 @@ export async function connectAgent(agentId: string): Promise<void> {
       else if (status === proto.WebMessageInfo.Status.READ) waStatus = 'read'
       else if (status === proto.WebMessageInfo.Status.PLAYED) waStatus = 'read'
       else if (status === proto.WebMessageInfo.Status.ERROR) waStatus = 'failed'
-
       if (waStatus) {
         const { error } = await supabase
           .from('communications')
@@ -180,22 +172,49 @@ export async function connectAgent(agentId: string): Promise<void> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Pairing code flow (phone number alternative to QR)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function getPairingCode(agentId: string, phone: string): Promise<string> {
+  // Create socket if it doesn't exist
+  if (!sockets.has(agentId)) {
+    await connectAgent(agentId)
+  }
+
+  const sock = sockets.get(agentId)
+  if (!sock) throw new Error('Failed to initialise WhatsApp connection')
+
+  const normalised = normalisePhone(phone)
+  logger.info({ agentId, normalised }, 'Requesting pairing code')
+
+  const code = await sock.requestPairingCode(normalised)
+
+  // Format as XXXX-XXXX for readability
+  const formatted = code.replace(/(.{4})(.{4})/, '$1-$2')
+
+  await setSessionStatus(agentId, 'pairing_code_ready', {
+    pairing_code: formatted,
+    qr_code: null,
+  })
+  await setProfileStatus(agentId, 'connecting')
+
+  logger.info({ agentId, code: formatted }, 'Pairing code generated and saved')
+  return formatted
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Disconnect
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function disconnectAgent(agentId: string): Promise<void> {
   const sock = sockets.get(agentId)
   if (sock) {
-    try {
-      await sock.logout()
-    } catch {
-      sock.end(undefined)
-    }
+    try { await sock.logout() } catch { sock.end(undefined) }
     sockets.delete(agentId)
   }
   const { error } = await supabase
     .from('wa_sessions')
-    .update({ creds: null, keys: null, status: 'disconnected', phone_jid: null, qr_code: null })
+    .update({ creds: null, keys: null, status: 'disconnected', phone_jid: null, qr_code: null, pairing_code: null })
     .eq('agent_id', agentId)
   if (error) logger.error({ error, agentId }, 'Failed to clear session on disconnect')
   await setProfileStatus(agentId, 'disconnected')
@@ -203,37 +222,26 @@ export async function disconnectAgent(agentId: string): Promise<void> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Send message
+// Send
 // ─────────────────────────────────────────────────────────────────────────────
 
-export async function sendMessage(
-  agentId: string,
-  phone: string,
-  text: string
-): Promise<string> {
+export async function sendMessage(agentId: string, phone: string, text: string): Promise<string> {
   const sock = sockets.get(agentId)
   if (!sock) throw new Error('Agent not connected to WhatsApp')
-
   const digits = phone.replace(/\D/g, '')
   const jid = digits + '@s.whatsapp.net'
-
   const result = await sock.sendMessage(jid, { text })
   const messageId = result?.key.id ?? ''
-
   logger.info({ agentId, jid, messageId }, 'Message sent')
   return messageId
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Status check
-// ─────────────────────────────────────────────────────────────────────────────
 
 export function isConnected(agentId: string): boolean {
   return sockets.has(agentId)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Restore sessions on service startup
+// Restore on startup
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function restoreActiveSessions(): Promise<void> {
@@ -247,10 +255,7 @@ export async function restoreActiveSessions(): Promise<void> {
     return
   }
 
-  if (!sessions?.length) {
-    logger.info('No active sessions to restore')
-    return
-  }
+  if (!sessions?.length) { logger.info('No active sessions to restore'); return }
 
   logger.info({ count: sessions.length }, 'Restoring active sessions')
   for (const session of sessions) {
