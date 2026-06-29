@@ -5,6 +5,7 @@ import pino from 'pino'
 import connectRoutes from './routes/connect'
 import sendRoutes from './routes/send'
 import { restoreActiveSessions } from './connectionManager'
+import { supabase } from './supabase'
 
 const logger = pino({ name: 'arkynex-wa' })
 const app = express()
@@ -20,9 +21,8 @@ if (!API_SECRET) {
 app.use(cors())
 app.use(express.json({ limit: '2mb' }))
 
-// Verify all requests carry the shared secret (set in Next.js env as WHATSAPP_SERVICE_SECRET)
 app.use((req: Request, res: Response, next: NextFunction) => {
-  if (req.path === '/health') return next() // health check is public
+  if (req.path === '/health') return next()
   const secret = req.headers['x-api-secret']
   if (secret !== API_SECRET) {
     return res.status(401).json({ error: 'Unauthorized' })
@@ -48,6 +48,26 @@ app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
 
 app.listen(PORT, async () => {
   logger.info({ port: PORT }, 'Arkynex WhatsApp service started')
-  // Reconnect any agents whose sessions were active before a restart
+
+  // On every startup, clear any in-progress states left over from before this restart.
+  // QR codes and pairing codes are in-memory — they can't survive a service restart.
+  // Without this, the frontend shows an expired QR whenever the service restarts.
+  const { error, count } = await supabase
+    .from('wa_sessions')
+    .update({
+      status: 'disconnected',
+      qr_code: null,
+      pairing_code: null,
+    })
+    .in('status', ['qr_ready', 'connecting', 'pairing_code_ready'])
+    .select()
+
+  if (error) {
+    logger.error({ error }, 'Startup: failed to clear stale sessions')
+  } else {
+    logger.info({ count }, 'Startup: cleared stale in-progress sessions → disconnected')
+  }
+
+  // Reconnect agents who were fully connected before the restart
   await restoreActiveSessions()
 })
