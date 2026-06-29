@@ -205,29 +205,21 @@ export async function getPairingCode(agentId: string, phone: string): Promise<st
   const sock = sockets.get(agentId)
   if (!sock) throw new Error('Failed to initialise WhatsApp connection')
 
-  // The first connection.update (what connectAgent() waits on) fires too
-  // early — Baileys emits it essentially as soon as the socket object is
-  // constructed, not once the transport is actually open. The real signal,
-  // per Baileys' own docs, is sock.ws.readyState === WebSocket.OPEN (1).
-  // Poll briefly for that before sending anything.
-  const wsOpenDeadline = Date.now() + 10_000
-  while (sock.ws?.readyState !== 1 && Date.now() < wsOpenDeadline) {
-    await new Promise((resolve) => setTimeout(resolve, 150))
-  }
-
   const normalised = normalisePhone(phone)
-  logger.info(
-    { agentId, normalised, wsReadyState: sock.ws?.readyState },
-    'Requesting pairing code'
-  )
+  logger.info({ agentId, normalised }, 'Requesting pairing code')
 
-  // Even with the transport reportedly OPEN, requestPairingCode() can still
-  // throw "Connection Closed" (428) for a brief window — this is a known
-  // Baileys flakiness, not just our timing. Retry a couple of times only for
-  // that specific case; any other error fails immediately.
+  // connectAgent() already waits for the socket's first connection.update,
+  // but Baileys can still throw "Connection Closed" (428) for a short window
+  // after that — known flakiness in the underlying WS handshake. We can't
+  // reliably check transport state directly: sock.ws is typed as
+  // WebSocketClient in this Baileys version (6.x) and doesn't publicly
+  // expose readyState (that's a v7-only API). Instead, retry the one public,
+  // stable call — requestPairingCode() — with backoff, only for the 428
+  // case; any other error fails immediately.
   let code: string | undefined
   let lastErr: unknown
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  const maxAttempts = 5
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       code = await sock.requestPairingCode(normalised)
       break
@@ -235,8 +227,8 @@ export async function getPairingCode(agentId: string, phone: string): Promise<st
       lastErr = err
       const statusCode = (err as Boom)?.output?.statusCode
       logger.warn({ err, agentId, attempt, statusCode }, 'requestPairingCode attempt failed')
-      if (statusCode !== 428) break
-      await new Promise((resolve) => setTimeout(resolve, 1200))
+      if (statusCode !== 428 || attempt === maxAttempts) break
+      await new Promise((resolve) => setTimeout(resolve, attempt * 1000))
     }
   }
 
