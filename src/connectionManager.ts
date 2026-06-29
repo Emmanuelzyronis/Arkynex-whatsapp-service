@@ -149,7 +149,15 @@ export async function connectAgent(agentId: string): Promise<void> {
           .eq('agent_id', agentId)
         if (error) logger.error({ error, agentId }, 'Failed to clear session on logout')
         await setProfileStatus(agentId, 'disconnected')
-        logger.info({ agentId }, 'Logged out — session cleared')
+        logger.info(
+          {
+            agentId,
+            statusCode,
+            disconnectReason: (lastDisconnect?.error as Boom)?.message,
+            disconnectData: (lastDisconnect?.error as Boom)?.output?.payload,
+          },
+          'Logged out — session cleared'
+        )
       } else {
         logger.warn({ agentId, statusCode }, 'Disconnected — reconnecting...')
         await setProfileStatus(agentId, 'connecting')
