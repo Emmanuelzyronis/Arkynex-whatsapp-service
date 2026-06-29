@@ -205,14 +205,43 @@ export async function getPairingCode(agentId: string, phone: string): Promise<st
   const sock = sockets.get(agentId)
   if (!sock) throw new Error('Failed to initialise WhatsApp connection')
 
-  const normalised = normalisePhone(phone)
-  logger.info({ agentId, normalised }, 'Requesting pairing code')
+  // The first connection.update (what connectAgent() waits on) fires too
+  // early — Baileys emits it essentially as soon as the socket object is
+  // constructed, not once the transport is actually open. The real signal,
+  // per Baileys' own docs, is sock.ws.readyState === WebSocket.OPEN (1).
+  // Poll briefly for that before sending anything.
+  const wsOpenDeadline = Date.now() + 10_000
+  while (sock.ws?.readyState !== 1 && Date.now() < wsOpenDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 150))
+  }
 
-  let code: string
-  try {
-    code = await sock.requestPairingCode(normalised)
-  } catch (err) {
-    logger.error({ err, agentId }, 'requestPairingCode failed')
+  const normalised = normalisePhone(phone)
+  logger.info(
+    { agentId, normalised, wsReadyState: sock.ws?.readyState },
+    'Requesting pairing code'
+  )
+
+  // Even with the transport reportedly OPEN, requestPairingCode() can still
+  // throw "Connection Closed" (428) for a brief window — this is a known
+  // Baileys flakiness, not just our timing. Retry a couple of times only for
+  // that specific case; any other error fails immediately.
+  let code: string | undefined
+  let lastErr: unknown
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      code = await sock.requestPairingCode(normalised)
+      break
+    } catch (err) {
+      lastErr = err
+      const statusCode = (err as Boom)?.output?.statusCode
+      logger.warn({ err, agentId, attempt, statusCode }, 'requestPairingCode attempt failed')
+      if (statusCode !== 428) break
+      await new Promise((resolve) => setTimeout(resolve, 1200))
+    }
+  }
+
+  if (!code) {
+    logger.error({ lastErr, agentId }, 'requestPairingCode failed after retries')
     throw new Error(
       'WhatsApp wasn\u2019t ready to issue a code yet \u2014 please tap "Get Code" again in a few seconds.'
     )
