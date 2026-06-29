@@ -94,6 +94,23 @@ export async function connectAgent(agentId: string): Promise<void> {
   sockets.set(agentId, sock)
   sock.ev.on('creds.update', saveCreds)
 
+  // makeWASocket() returns before the underlying WebSocket to WhatsApp's
+  // servers has finished opening. Calling requestPairingCode() (or anything
+  // else that sends a stanza) before then throws "Connection Closed" (428) —
+  // this was the race causing pairing to fail. `socketReady` resolves once
+  // the socket emits its first connection.update, by which point the WS
+  // handshake is underway and outgoing stanzas can be sent. A short fallback
+  // timer guarantees connectAgent() never hangs forever if no update arrives.
+  let resolveReady: () => void
+  const socketReady = new Promise<void>((resolve) => { resolveReady = resolve })
+  const readyFallback = setTimeout(() => resolveReady(), 35_000)
+  const onFirstUpdate = () => {
+    clearTimeout(readyFallback)
+    sock.ev.off('connection.update', onFirstUpdate)
+    resolveReady()
+  }
+  sock.ev.on('connection.update', onFirstUpdate)
+
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update
 
@@ -169,6 +186,10 @@ export async function connectAgent(agentId: string): Promise<void> {
       }
     }
   })
+
+  // Don't resolve until the socket has had its first chance to open —
+  // see the comment above where `socketReady` is created.
+  await socketReady
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -187,7 +208,15 @@ export async function getPairingCode(agentId: string, phone: string): Promise<st
   const normalised = normalisePhone(phone)
   logger.info({ agentId, normalised }, 'Requesting pairing code')
 
-  const code = await sock.requestPairingCode(normalised)
+  let code: string
+  try {
+    code = await sock.requestPairingCode(normalised)
+  } catch (err) {
+    logger.error({ err, agentId }, 'requestPairingCode failed')
+    throw new Error(
+      'WhatsApp wasn\u2019t ready to issue a code yet \u2014 please tap "Get Code" again in a few seconds.'
+    )
+  }
 
   // Format as XXXX-XXXX for readability
   const formatted = code.replace(/(.{4})(.{4})/, '$1-$2')
