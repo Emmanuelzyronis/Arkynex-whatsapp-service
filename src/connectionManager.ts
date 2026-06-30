@@ -41,8 +41,16 @@ async function setSessionStatus(
     )
   if (error) {
     logger.error(
-      { error, agentId, status, extra: Object.keys(extra) },
-      'setSessionStatus: Supabase upsert FAILED — check SUPABASE_SERVICE_ROLE_KEY in Railway env'
+      {
+        agentId,
+        status,
+        extra: Object.keys(extra),
+        pgCode: error.code,
+        pgMessage: error.message,
+        pgDetails: error.details,
+        pgHint: error.hint,
+      },
+      'setSessionStatus: Supabase upsert failed'
     )
   }
 }
