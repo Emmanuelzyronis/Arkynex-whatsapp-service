@@ -31,6 +31,18 @@ const pendingPairingRequests = new Map<
 // non-pairing socket mid-retry.
 const activePairingFlows = new Set<string>()
 
+// Agents whose current socket has reached 'open' at least once since the
+// last full reset (disconnect/logout). An initial QR/pairing attempt that
+// never once succeeded should NOT auto-reconnect in the background after
+// the user has already seen it fail — only a session that was genuinely
+// established and then dropped should try to recover itself.
+const everConnected = new Set<string>()
+
+// Consecutive auto-reconnect failures per agent, for backoff. Reset on a
+// successful 'open' and cleared once we give up.
+const reconnectAttempts = new Map<string, number>()
+const MAX_RECONNECT_ATTEMPTS = 8
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal helpers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -209,6 +221,8 @@ export async function connectAgent(agentId: string, pairingPhone?: string): Prom
     }
 
     if (connection === 'open') {
+      everConnected.add(agentId)
+      reconnectAttempts.delete(agentId)
       const phoneJid = sock.user?.id ?? null
       await setSessionStatus(agentId, 'connected', {
         phone_jid: phoneJid,
@@ -232,6 +246,8 @@ export async function connectAgent(agentId: string, pairingPhone?: string): Prom
       }
 
       if (loggedOut) {
+        everConnected.delete(agentId)
+        reconnectAttempts.delete(agentId)
         const { error } = await supabase
           .from('wa_sessions')
           .update({ creds: null, keys: null, status: 'disconnected', phone_jid: null, qr_code: null, pairing_code: null })
@@ -247,14 +263,38 @@ export async function connectAgent(agentId: string, pairingPhone?: string): Prom
           },
           'Logged out — session cleared'
         )
+      } else if (activePairingFlows.has(agentId)) {
+        logger.warn({ agentId, statusCode }, 'Disconnected during pairing retry — getPairingCode() owns reconnection')
+      } else if (!everConnected.has(agentId)) {
+        // This connection never once succeeded — nothing to "recover".
+        // Retrying forever in the background after the user already saw a
+        // failure just keeps hammering WhatsApp's servers. Stop and let
+        // the user retry deliberately from the UI.
+        logger.warn({ agentId, statusCode }, 'Initial connection attempt failed — not auto-reconnecting')
+        await setSessionStatus(agentId, 'disconnected', { qr_code: null, pairing_code: null })
+        await setProfileStatus(agentId, 'disconnected')
       } else {
-        logger.warn({ agentId, statusCode }, 'Disconnected — reconnecting...')
-        await setProfileStatus(agentId, 'connecting')
-        // getPairingCode() drives its own reconnect sequence during a
-        // pairing retry cycle — don't race it with a second, independent
-        // socket for the same agent.
-        if (!activePairingFlows.has(agentId)) {
-          setTimeout(() => connectAgent(agentId), 3000)
+        const attempts = (reconnectAttempts.get(agentId) ?? 0) + 1
+        reconnectAttempts.set(agentId, attempts)
+
+        if (attempts > MAX_RECONNECT_ATTEMPTS) {
+          logger.error(
+            { agentId, statusCode, attempts },
+            'Giving up after repeated reconnect failures — marking disconnected'
+          )
+          reconnectAttempts.delete(agentId)
+          everConnected.delete(agentId)
+          await setSessionStatus(agentId, 'disconnected', { qr_code: null, pairing_code: null })
+          await setProfileStatus(agentId, 'disconnected')
+        } else {
+          // Exponential backoff (3s, 6s, 12s, 24s...) capped at 5 minutes —
+          // previously this was a flat 3s retry with no ceiling, which is
+          // what produced an unbroken chain of reconnect attempts every few
+          // seconds for minutes on end when WhatsApp kept rejecting them.
+          const delayMs = Math.min(3000 * 2 ** (attempts - 1), 5 * 60_000)
+          logger.warn({ agentId, statusCode, attempts, delayMs }, 'Disconnected — reconnecting with backoff...')
+          await setProfileStatus(agentId, 'connecting')
+          setTimeout(() => connectAgent(agentId), delayMs)
         }
       }
     }
@@ -404,6 +444,8 @@ export async function disconnectAgent(agentId: string): Promise<void> {
     try { await sock.logout() } catch { sock.end(undefined) }
     sockets.delete(agentId)
   }
+  everConnected.delete(agentId)
+  reconnectAttempts.delete(agentId)
   const { error } = await supabase
     .from('wa_sessions')
     .update({ creds: null, keys: null, status: 'disconnected', phone_jid: null, qr_code: null, pairing_code: null })
@@ -452,6 +494,7 @@ export async function restoreActiveSessions(): Promise<void> {
   logger.info({ count: sessions.length }, 'Restoring active sessions')
   for (const session of sessions) {
     if (session.creds) {
+      everConnected.add(session.agent_id)
       connectAgent(session.agent_id).catch((err) =>
         logger.error({ err, agentId: session.agent_id }, 'Failed to restore session')
       )
