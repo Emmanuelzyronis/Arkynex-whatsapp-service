@@ -16,6 +16,14 @@ const logger = pino({ name: 'connection-manager' })
 
 const sockets = new Map<string, WASocket>()
 
+// In-flight pairing-code requests, keyed by agentId. getPairingCode() populates
+// this and returns a Promise that's resolved/rejected from inside the
+// connection.update handler below — see the comment in getPairingCode for why.
+const pendingPairingRequests = new Map<
+  string,
+  { phone: string; resolve: (code: string) => void; reject: (err: Error) => void }
+>()
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal helpers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -32,7 +40,7 @@ async function setSessionStatus(
   agentId: string,
   status: string,
   extra: Record<string, unknown> = {}
-) {
+): Promise<boolean> {
   const { error } = await supabase
     .from('wa_sessions')
     .upsert(
@@ -52,7 +60,9 @@ async function setSessionStatus(
       },
       'setSessionStatus: Supabase upsert failed'
     )
+    return false
   }
+  return true
 }
 
 // Normalise Nigerian phone numbers to international digits (no + or spaces)
@@ -68,11 +78,13 @@ function normalisePhone(phone: string): string {
 // Connect (QR flow)
 // ─────────────────────────────────────────────────────────────────────────────
 
-export async function connectAgent(agentId: string): Promise<void> {
+export async function connectAgent(agentId: string, pairingPhone?: string): Promise<void> {
   if (sockets.has(agentId)) {
     logger.info({ agentId }, 'Socket already open')
     return
   }
+
+  const isPairingFlow = !!pairingPhone
 
   let version: [number, number, number]
   try {
@@ -97,6 +109,11 @@ export async function connectAgent(agentId: string): Promise<void> {
     logger: pino({ level: 'silent' }) as ReturnType<typeof pino>,
     connectTimeoutMs: 30_000,
     retryRequestDelayMs: 2000,
+    // Baileys' default query timeout can fire before WhatsApp responds to
+    // requestPairingCode(), which surfaces as a client-side "Connection
+    // Closed" (428) even though nothing is actually wrong with the socket.
+    // Disabling it is the documented fix for that specific failure mode.
+    defaultQueryTimeoutMs: isPairingFlow ? undefined : 60_000,
   })
 
   sockets.set(agentId, sock)
@@ -120,9 +137,60 @@ export async function connectAgent(agentId: string): Promise<void> {
   sock.ev.on('connection.update', onFirstUpdate)
 
   sock.ev.on('connection.update', async (update) => {
+    // getPairingCode() tears down an existing socket before opening a fresh
+    // one (see comment there). That old socket's own 'close' event can
+    // still arrive after the new socket has already taken its place in
+    // `sockets`. If we let it run, it would delete the new socket's map
+    // entry and reject the new pending request out from under it. Guard
+    // every event on this socket still being the current one for the agent.
+    if (sockets.get(agentId) !== sock) return
+
     const { connection, lastDisconnect, qr } = update
 
-    if (qr) {
+    // Pairing-code flow: per Baileys' docs, requestPairingCode() must be
+    // called as the socket reaches 'connecting' (or as soon as a qr stanza
+    // is available) — https://baileys.wiki/docs/socket/connecting/. Doing it
+    // any later, from outside this handler, leaves a window where the
+    // standard QR handshake has already taken over, which is what caused
+    // the "Connection Closed" (428) errors and — worse — a logged-out (401)
+    // close arriving a second or two after a code had already been issued.
+    // We request it here, exactly once per socket (the pending entry is
+    // removed as soon as we act on it).
+    const pending = pendingPairingRequests.get(agentId)
+    if (pending && (connection === 'connecting' || qr)) {
+      pendingPairingRequests.delete(agentId)
+      try {
+        const code = await sock.requestPairingCode(pending.phone)
+        const formatted = code.replace(/(.{4})(.{4})/, '$1-$2')
+        // WhatsApp has already issued the code at this point — but don't
+        // report success to the frontend unless it's actually persisted.
+        // Previously this write's failure was only logged (see
+        // setSessionStatus), so a code could reach the UI that was never in
+        // the DB — the next Realtime/poll update would then show whatever
+        // the DB actually had, making the code look like it "vanished" with
+        // no explanation. Surfacing the failure here instead means the
+        // agent sees a real error and can retry, rather than a code that
+        // silently stops working.
+        const persisted = await setSessionStatus(agentId, 'pairing_code_ready', { pairing_code: formatted, qr_code: null })
+        await setProfileStatus(agentId, 'connecting')
+        if (!persisted) {
+          throw new Error('Got a pairing code from WhatsApp, but couldn\u2019t save it — please try again.')
+        }
+        logger.info({ agentId, code: formatted }, 'Pairing code generated and saved')
+        pending.resolve(formatted)
+      } catch (err) {
+        logger.error({ err, agentId }, 'requestPairingCode failed')
+        pending.reject(
+          err instanceof Error
+            ? err
+            : new Error('WhatsApp wasn\u2019t ready to issue a code yet — please tap "Get Code" again in a few seconds.')
+        )
+      }
+    }
+
+    // Skip the QR write entirely on a pairing-code socket — we requested a
+    // code, not a QR, and writing qr_ready here would race the write above.
+    if (qr && !isPairingFlow) {
       try {
         const qrDataUrl = await QRCode.toDataURL(qr, { margin: 2, scale: 6 })
         await setSessionStatus(agentId, 'qr_ready', { qr_code: qrDataUrl, pairing_code: null })
@@ -149,6 +217,12 @@ export async function connectAgent(agentId: string): Promise<void> {
       sockets.delete(agentId)
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode
       const loggedOut = statusCode === DisconnectReason.loggedOut
+
+      const stillPending = pendingPairingRequests.get(agentId)
+      if (stillPending) {
+        pendingPairingRequests.delete(agentId)
+        stillPending.reject(new Error('Connection closed before a pairing code could be issued — please tap "Get Code" again.'))
+      }
 
       if (loggedOut) {
         const { error } = await supabase
@@ -213,59 +287,46 @@ export async function connectAgent(agentId: string): Promise<void> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function getPairingCode(agentId: string, phone: string): Promise<string> {
-  // Create socket if it doesn't exist
-  if (!sockets.has(agentId)) {
-    await connectAgent(agentId)
-  }
-
-  const sock = sockets.get(agentId)
-  if (!sock) throw new Error('Failed to initialise WhatsApp connection')
-
   const normalised = normalisePhone(phone)
   logger.info({ agentId, normalised }, 'Requesting pairing code')
 
-  // connectAgent() already waits for the socket's first connection.update,
-  // but Baileys can still throw "Connection Closed" (428) for a short window
-  // after that — known flakiness in the underlying WS handshake. We can't
-  // reliably check transport state directly: sock.ws is typed as
-  // WebSocketClient in this Baileys version (6.x) and doesn't publicly
-  // expose readyState (that's a v7-only API). Instead, retry the one public,
-  // stable call — requestPairingCode() — with backoff, only for the 428
-  // case; any other error fails immediately.
-  let code: string | undefined
-  let lastErr: unknown
-  const maxAttempts = 5
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      code = await sock.requestPairingCode(normalised)
-      break
-    } catch (err) {
-      lastErr = err
-      const statusCode = (err as Boom)?.output?.statusCode
-      logger.warn({ err, agentId, attempt, statusCode }, 'requestPairingCode attempt failed')
-      if (statusCode !== 428 || attempt === maxAttempts) break
-      await new Promise((resolve) => setTimeout(resolve, attempt * 1000))
-    }
+  // A pairing-code request needs a *freshly opened* socket where
+  // requestPairingCode() is the first stanza sent — see the comment in the
+  // connection.update handler above. Tear down anything already open for
+  // this agent (a leftover QR attempt, or a previous failed pairing
+  // attempt) rather than reusing it. Reusing a socket that already had one
+  // failed/uncertain requestPairingCode() call is what used to cause a
+  // second call on the same connection — which lines up with WhatsApp
+  // forcing a logged-out close roughly a second after a code was issued.
+  const existing = sockets.get(agentId)
+  if (existing) {
+    try { existing.end(undefined) } catch { /* socket already dead — fine */ }
+    sockets.delete(agentId)
   }
+  pendingPairingRequests.delete(agentId)
 
-  if (!code) {
-    logger.error({ lastErr, agentId }, 'requestPairingCode failed after retries')
-    throw new Error(
-      'WhatsApp wasn\u2019t ready to issue a code yet \u2014 please tap "Get Code" again in a few seconds.'
-    )
-  }
+  return new Promise<string>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      if (pendingPairingRequests.delete(agentId)) {
+        reject(new Error('WhatsApp wasn\u2019t ready to issue a code yet \u2014 please tap "Get Code" again in a few seconds.'))
+      }
+    }, 20_000)
 
-  // Format as XXXX-XXXX for readability
-  const formatted = code.replace(/(.{4})(.{4})/, '$1-$2')
+    pendingPairingRequests.set(agentId, {
+      phone: normalised,
+      resolve: (code) => { clearTimeout(timeout); resolve(code) },
+      reject: (err) => { clearTimeout(timeout); reject(err) },
+    })
 
-  await setSessionStatus(agentId, 'pairing_code_ready', {
-    pairing_code: formatted,
-    qr_code: null,
+    // The actual requestPairingCode() call happens inside the
+    // connection.update handler once this socket reaches 'connecting'.
+    connectAgent(agentId, normalised).catch((err) => {
+      if (pendingPairingRequests.delete(agentId)) {
+        clearTimeout(timeout)
+        reject(err instanceof Error ? err : new Error('Failed to initialise WhatsApp connection'))
+      }
+    })
   })
-  await setProfileStatus(agentId, 'connecting')
-
-  logger.info({ agentId, code: formatted }, 'Pairing code generated and saved')
-  return formatted
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
