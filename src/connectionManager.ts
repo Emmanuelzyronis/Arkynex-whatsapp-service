@@ -24,6 +24,13 @@ const pendingPairingRequests = new Map<
   { phone: string; resolve: (code: string) => void; reject: (err: Error) => void }
 >()
 
+// Agents currently inside getPairingCode()'s retry loop (see below). While
+// true, the generic reconnect-on-close logic in connectAgent() backs off —
+// getPairingCode() is already driving its own sequence of fresh connection
+// attempts, and letting both reconnect independently could spin up a second,
+// non-pairing socket mid-retry.
+const activePairingFlows = new Set<string>()
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal helpers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -243,7 +250,12 @@ export async function connectAgent(agentId: string, pairingPhone?: string): Prom
       } else {
         logger.warn({ agentId, statusCode }, 'Disconnected — reconnecting...')
         await setProfileStatus(agentId, 'connecting')
-        setTimeout(() => connectAgent(agentId), 3000)
+        // getPairingCode() drives its own reconnect sequence during a
+        // pairing retry cycle — don't race it with a second, independent
+        // socket for the same agent.
+        if (!activePairingFlows.has(agentId)) {
+          setTimeout(() => connectAgent(agentId), 3000)
+        }
       }
     }
   })
@@ -290,43 +302,96 @@ export async function getPairingCode(agentId: string, phone: string): Promise<st
   const normalised = normalisePhone(phone)
   logger.info({ agentId, normalised }, 'Requesting pairing code')
 
-  // A pairing-code request needs a *freshly opened* socket where
-  // requestPairingCode() is the first stanza sent — see the comment in the
-  // connection.update handler above. Tear down anything already open for
-  // this agent (a leftover QR attempt, or a previous failed pairing
-  // attempt) rather than reusing it. Reusing a socket that already had one
-  // failed/uncertain requestPairingCode() call is what used to cause a
-  // second call on the same connection — which lines up with WhatsApp
-  // forcing a logged-out close roughly a second after a code was issued.
-  const existing = sockets.get(agentId)
-  if (existing) {
-    try { existing.end(undefined) } catch { /* socket already dead — fine */ }
-    sockets.delete(agentId)
-  }
-  pendingPairingRequests.delete(agentId)
+  // Even calling requestPairingCode() from inside connection.update, gated
+  // on 'connecting'/qr — the pattern Baileys' own docs recommend — can still
+  // throw "Connection Closed" (428): WhatsApp's socket sometimes reports
+  // 'connecting' a moment before it's actually ready to send a stanza, and
+  // the socket then dies (often with a 401 close right behind it). This is
+  // a known, reported Baileys flakiness, not a sign the calling pattern is
+  // wrong. The documented mitigation is to retry — but critically, with a
+  // completely fresh socket each time; retrying requestPairingCode() on the
+  // *same* socket is what caused the previous, different bug (WhatsApp's
+  // abuse detection kicking in on a reused connection).
+  const maxAttempts = 3
+  activePairingFlows.add(agentId)
+  try {
+    let lastErr: Error = new Error('Failed to generate pairing code')
+    let sawTransientFailure = false
 
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const existing = sockets.get(agentId)
+      if (existing) {
+        try { existing.end(undefined) } catch { /* socket already dead — fine */ }
+        sockets.delete(agentId)
+      }
+      pendingPairingRequests.delete(agentId)
+
+      try {
+        return await attemptPairingCode(agentId, normalised)
+      } catch (err) {
+        lastErr = err instanceof Error ? err : new Error(String(err))
+        const transient = isTransientPairingFailure(lastErr)
+        if (transient) sawTransientFailure = true
+        logger.warn(
+          { agentId, attempt, err: lastErr.message, transient },
+          'Pairing code attempt failed'
+        )
+        // Only retry the specific "socket wasn't really ready" signature.
+        // A DB-persistence failure (see setSessionStatus above) won't be
+        // fixed by asking WhatsApp for another code, and retrying would
+        // just spend another one for no reason — surface that immediately.
+        if (!transient || attempt === maxAttempts) break
+        await new Promise((resolve) => setTimeout(resolve, attempt * 1000))
+      }
+    }
+
+    logger.error({ agentId, err: lastErr }, 'getPairingCode failed after retries')
+    if (sawTransientFailure) {
+      throw new Error(
+        'WhatsApp\u2019s servers weren\u2019t ready to issue a code after a few tries \u2014 please wait a moment and tap "Get Code" again.'
+      )
+    }
+    throw lastErr
+  } finally {
+    activePairingFlows.delete(agentId)
+  }
+}
+
+// A single pairing-code attempt on one fresh socket. Resolves/rejects via
+// the pendingPairingRequests entry that the connection.update handler in
+// connectAgent() acts on — see the comment there for why the request has to
+// be made from inside that handler rather than here directly.
+function attemptPairingCode(agentId: string, normalisedPhone: string): Promise<string> {
   return new Promise<string>((resolve, reject) => {
     const timeout = setTimeout(() => {
       if (pendingPairingRequests.delete(agentId)) {
         reject(new Error('WhatsApp wasn\u2019t ready to issue a code yet \u2014 please tap "Get Code" again in a few seconds.'))
       }
-    }, 20_000)
+    }, 15_000)
 
     pendingPairingRequests.set(agentId, {
-      phone: normalised,
+      phone: normalisedPhone,
       resolve: (code) => { clearTimeout(timeout); resolve(code) },
       reject: (err) => { clearTimeout(timeout); reject(err) },
     })
 
-    // The actual requestPairingCode() call happens inside the
-    // connection.update handler once this socket reaches 'connecting'.
-    connectAgent(agentId, normalised).catch((err) => {
+    connectAgent(agentId, normalisedPhone).catch((err) => {
       if (pendingPairingRequests.delete(agentId)) {
         clearTimeout(timeout)
         reject(err instanceof Error ? err : new Error('Failed to initialise WhatsApp connection'))
       }
     })
   })
+}
+
+// True for failure signatures that reflect the socket not truly being ready
+// yet (428, or our own close-handler firing before a code was issued) —
+// worth a fresh-socket retry. False for anything else, notably the
+// DB-persistence-failed case, which a retry can't fix.
+function isTransientPairingFailure(err: Error): boolean {
+  const statusCode = (err as { output?: { statusCode?: number } })?.output?.statusCode
+  if (statusCode === 428) return true
+  return /before a pairing code could be issued/i.test(err.message)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
