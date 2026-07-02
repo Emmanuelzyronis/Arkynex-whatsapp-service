@@ -7,23 +7,56 @@ import {
 } from '@whiskeysockets/baileys'
 import { supabase } from './supabase'
 
+// Recursively replace Buffer/Uint8Array instances with a plain, JSON-safe
+// marker object BEFORE JSON.stringify ever touches them. This can't be done
+// via JSON.stringify's replacer argument (the approach this used to use):
+// Node's Buffer has its own toJSON(), and JSON.stringify always calls that
+// *before* handing the value to a replacer — silently turning every real
+// Buffer into { type: 'Buffer', data: [...] } first. The replacer then only
+// ever sees that already-converted plain object, never an actual Buffer, so
+// the custom marker below was never actually being applied to real key
+// material. That mismatched shape is what was genuinely sitting in
+// Supabase, and deserialize() didn't recognise it — so Baileys' own crypto
+// calls were receiving a plain object where they needed a Buffer.
+function markBuffers(value: unknown): unknown {
+  if (Buffer.isBuffer(value) || value instanceof Uint8Array) {
+    return { __t: 'buf', d: Array.from(value as Uint8Array) }
+  }
+  if (Array.isArray(value)) {
+    return value.map(markBuffers)
+  }
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[k] = markBuffers(v)
+    }
+    return out
+  }
+  return value
+}
+
 // Serialize Buffers/Uint8Arrays to plain JSON so they survive Supabase JSONB round-trips
 function serialize(obj: unknown): unknown {
-  return JSON.parse(
-    JSON.stringify(obj, (_key, value) => {
-      if (value instanceof Uint8Array || Buffer.isBuffer(value)) {
-        return { __t: 'buf', d: Array.from(value as Uint8Array) }
-      }
-      return value
-    })
-  )
+  // markBuffers() runs first so no raw Buffer ever reaches JSON.stringify —
+  // see the comment above for why that ordering matters. The stringify/parse
+  // pass after it just normalises anything else non-JSON-safe (undefined,
+  // etc.), same as before.
+  return JSON.parse(JSON.stringify(markBuffers(obj)))
 }
 
 // Restore Buffers from their serialized form
 function deserialize<T>(obj: unknown): T {
   return JSON.parse(JSON.stringify(obj), (_key, value) => {
-    if (value && typeof value === 'object' && value.__t === 'buf' && Array.isArray(value.d)) {
-      return Buffer.from(value.d)
+    if (value && typeof value === 'object') {
+      if (value.__t === 'buf' && Array.isArray(value.d)) {
+        return Buffer.from(value.d)
+      }
+      // Rows written before this fix have Node's default Buffer shape
+      // (see markBuffers' comment) rather than the marker above — recognise
+      // that too so existing sessions don't need to be reset.
+      if (value.type === 'Buffer' && Array.isArray(value.data)) {
+        return Buffer.from(value.data)
+      }
     }
     return value
   }) as T
