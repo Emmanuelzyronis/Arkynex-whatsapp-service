@@ -27,7 +27,7 @@ const pendingPairingRequests = new Map<
 // Agents currently inside getPairingCode()'s retry loop (see below). While
 // true, the generic reconnect-on-close logic in connectAgent() backs off —
 // getPairingCode() is already driving its own sequence of fresh connection
-// attempts, and letting both reconnect independently could spin up a second,
+// attempts, and letting both reconnect idependently could spin up a second,
 // non-pairing socket mid-retry.
 const activePairingFlows = new Set<string>()
 
